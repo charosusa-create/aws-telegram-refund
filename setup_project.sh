@@ -1,8 +1,70 @@
 #!/usr/bin/env bash
-# Creates the whole refund-agent project in ~/refund-agent (run inside AWS CloudShell).
-set -e
-mkdir -p ~/refund-agent/src
-cd ~/refund-agent
+# =============================================================================
+# refund_agent.sh : every CloudShell script for the Telegram refund agent
+# Run inside AWS CloudShell (same region where Bedrock Haiku 4.5 works).
+#
+# Usage:  bash refund_agent.sh <command>
+#
+#   all        files + secret + deploy + webhook (first-time setup)
+#   files      create the project in ~/refund-agent
+#   secret     store bot token + approver ID in Secrets Manager (asks you)
+#   deploy     package + deploy the stack (auto-detects the Haiku 4.5 model)
+#   webhook    point your Telegram bot at the deployed API
+#   status     show stack status and Telegram webhook health
+#   logs       tail the webhook Lambda logs (Ctrl+C to stop)
+#   refunds    list refund records and their status
+#   reset ID   allow an order to be refunded again, e.g.  reset 1001
+#   cleanup    delete EVERYTHING (stack, bucket, secret, logs, webhook)
+#
+# Before "all": create the bot with @BotFather, get your user ID from
+# @userinfobot, press Start on the bot, and make sure Bedrock access works.
+# =============================================================================
+set -euo pipefail
+
+REGION="${AWS_REGION:-us-east-1}"
+STACK="refund-agent"
+SECRET="refund-bot/config"
+DIR="$HOME/refund-agent"
+
+# ------------------------------------------------------------------ helpers
+account_id() { aws sts get-caller-identity --query Account --output text; }
+bucket()     { echo "refund-agent-artifacts-$(account_id)"; }
+
+get_model() {
+  MODEL_ID="${MODEL_ID:-}"
+  if [ -z "$MODEL_ID" ] || [ "$MODEL_ID" = "None" ]; then
+    MODEL_ID=$(aws bedrock list-inference-profiles --region "$REGION" \
+      --query "inferenceProfileSummaries[?contains(inferenceProfileId,'haiku-4-5')].inferenceProfileId | [0]" \
+      --output text)
+  fi
+  if [ -z "$MODEL_ID" ] || [ "$MODEL_ID" = "None" ]; then
+    echo "Could not auto-detect a Haiku 4.5 model. List options with:"
+    echo "  aws bedrock list-inference-profiles --region $REGION --query \"inferenceProfileSummaries[?contains(inferenceProfileId,'anthropic')].inferenceProfileId\" --output text"
+    echo "then run:  export MODEL_ID=<id>  and retry."
+    exit 1
+  fi
+  echo "Using model: $MODEL_ID"
+}
+
+webhook_url() {
+  aws cloudformation describe-stacks --stack-name "$STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='WebhookUrl'].OutputValue" --output text
+}
+
+secret_field() {
+  aws secretsmanager get-secret-value --secret-id "$SECRET" \
+    --query SecretString --output text | jq -r ".$1"
+}
+
+table_name() {
+  aws cloudformation describe-stack-resources --stack-name "$STACK" \
+    --query "StackResources[?ResourceType=='AWS::DynamoDB::Table'].PhysicalResourceId" --output text
+}
+
+# ------------------------------------------------------------------ files
+cmd_files() {
+mkdir -p "$DIR/src"
+cd "$DIR"
 
 # ---------------------------------------------------------------- template.yaml
 cat > template.yaml <<'EOF'
@@ -23,7 +85,6 @@ Globals:
     Runtime: python3.12
     Timeout: 29
     MemorySize: 256
-    CodeUri: src/
     Environment:
       Variables:
         TABLE_NAME: !Ref AppTable
@@ -49,6 +110,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: webhook.handler
+      CodeUri: src/
       Environment:
         Variables:
           STATE_MACHINE_ARN: !Ref RefundStateMachine
@@ -81,6 +143,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: notify_approver.handler
+      CodeUri: src/
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AppTable
@@ -91,6 +154,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: finalize.handler
+      CodeUri: src/
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref AppTable
@@ -656,5 +720,149 @@ def handler(event, context):
 EOF
 
 echo
-echo "Project created in ~/refund-agent:"
-find ~/refund-agent -type f | sort
+echo "Project created in $DIR:"
+find "$DIR" -type f | sort
+}
+
+# ------------------------------------------------------------------ secret
+cmd_secret() {
+  read -rsp "Telegram bot token (hidden, paste then Enter): " BOT_TOKEN; echo
+  read -rp  "Approver Telegram user ID (digits): " APPROVER
+  if [ -z "$BOT_TOKEN" ] || [ -z "$APPROVER" ]; then
+    echo "Token or approver ID was empty. Nothing saved."
+    exit 1
+  fi
+  WEBHOOK_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+  JSON=$(jq -n --arg t "$BOT_TOKEN" --arg w "$WEBHOOK_SECRET" --arg a "$APPROVER" \
+    '{bot_token:$t, webhook_secret:$w, approver_ids:$a}')
+  if aws secretsmanager describe-secret --secret-id "$SECRET" >/dev/null 2>&1; then
+    aws secretsmanager put-secret-value --secret-id "$SECRET" --secret-string "$JSON" >/dev/null
+    echo "Secret updated."
+  else
+    aws secretsmanager create-secret --name "$SECRET" --secret-string "$JSON" >/dev/null
+    echo "Secret created."
+  fi
+  unset BOT_TOKEN WEBHOOK_SECRET JSON
+}
+
+# ------------------------------------------------------------------ deploy
+cmd_deploy() {
+  [ -f "$DIR/template.yaml" ] || cmd_files
+  get_model
+  cd "$DIR"
+  local B; B=$(bucket)
+  aws s3api head-bucket --bucket "$B" 2>/dev/null || aws s3 mb "s3://$B" --region "$REGION"
+
+  aws cloudformation package \
+    --template-file template.yaml \
+    --s3-bucket "$B" \
+    --output-template-file packaged.yaml
+
+  aws cloudformation deploy \
+    --template-file packaged.yaml \
+    --stack-name "$STACK" \
+    --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+    --parameter-overrides ModelId="$MODEL_ID"
+
+  echo "Webhook URL: $(webhook_url)"
+}
+
+# ------------------------------------------------------------------ webhook
+cmd_webhook() {
+  local URL TOKEN WSECRET
+  URL=$(webhook_url)
+  if [ -z "$URL" ] || [ "$URL" = "None" ]; then
+    echo "No webhook URL found. Is the stack deployed? Run: bash refund_agent.sh deploy"
+    exit 1
+  fi
+  TOKEN=$(secret_field bot_token)
+  WSECRET=$(secret_field webhook_secret)
+  curl -s -X POST "https://api.telegram.org/bot$TOKEN/setWebhook" \
+    --data-urlencode "url=$URL" --data-urlencode "secret_token=$WSECRET"
+  echo
+  curl -s "https://api.telegram.org/bot$TOKEN/getWebhookInfo" \
+    | jq '.result | {url, pending_update_count, last_error_message}'
+}
+
+# ------------------------------------------------------------------ status
+cmd_status() {
+  echo "Stack status:"
+  aws cloudformation describe-stacks --stack-name "$STACK" \
+    --query "Stacks[0].StackStatus" --output text
+  local TOKEN; TOKEN=$(secret_field bot_token)
+  echo "Telegram webhook:"
+  curl -s "https://api.telegram.org/bot$TOKEN/getWebhookInfo" \
+    | jq '.result | {url, pending_update_count, last_error_message}'
+}
+
+# ------------------------------------------------------------------ logs
+cmd_logs() {
+  local FN
+  FN=$(aws cloudformation describe-stack-resource --stack-name "$STACK" \
+    --logical-resource-id WebhookFunction \
+    --query StackResourceDetail.PhysicalResourceId --output text)
+  aws logs tail "/aws/lambda/$FN" --since 15m --follow
+}
+
+# ------------------------------------------------------------------ refunds
+cmd_refunds() {
+  aws dynamodb scan --table-name "$(table_name)" \
+    --filter-expression "begins_with(pk, :p)" \
+    --expression-attribute-values '{":p":{"S":"refund#"}}' \
+    --query "Items[].{refund:refund_id.S, order:order_id.S, amount:amount.S, status:status.S}" \
+    --output table
+}
+
+# ------------------------------------------------------------------ reset
+cmd_reset() {
+  local ORDER="${1:-}"
+  if [ -z "$ORDER" ]; then
+    echo "Usage: bash refund_agent.sh reset <order_id>   e.g. reset 1001"
+    exit 1
+  fi
+  aws dynamodb delete-item --table-name "$(table_name)" \
+    --key "{\"pk\":{\"S\":\"refund#R-$ORDER\"}}"
+  echo "Order $ORDER can be refunded again."
+}
+
+# ------------------------------------------------------------------ cleanup
+cmd_cleanup() {
+  read -rp "This deletes EVERYTHING (stack, bucket, secret, logs, webhook). Type DELETE to confirm: " ans
+  if [ "$ans" != "DELETE" ]; then echo "Cancelled."; exit 0; fi
+
+  local TOKEN=""
+  TOKEN=$(secret_field bot_token 2>/dev/null) || TOKEN=""
+  if [ -n "$TOKEN" ]; then
+    curl -s "https://api.telegram.org/bot$TOKEN/deleteWebhook"; echo
+  fi
+
+  aws cloudformation delete-stack --stack-name "$STACK"
+  aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+
+  aws s3 rb "s3://$(bucket)" --force 2>/dev/null || echo "(bucket already gone)"
+  aws secretsmanager delete-secret --secret-id "$SECRET" --force-delete-without-recovery >/dev/null 2>&1 \
+    || echo "(secret already gone)"
+
+  for g in $(aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/$STACK" \
+      --query "logGroups[].logGroupName" --output text); do
+    aws logs delete-log-group --log-group-name "$g"
+  done
+
+  echo "Cleanup done. Optional: rm -rf $DIR   and delete the bot with @BotFather (/deletebot)."
+}
+
+# ------------------------------------------------------------------ router
+case "${1:-help}" in
+  all)      cmd_files; cmd_secret; cmd_deploy; cmd_webhook
+            echo; echo "Done. Open Telegram and send /start to your bot." ;;
+  files)    cmd_files ;;
+  secret)   cmd_secret ;;
+  deploy)   cmd_deploy ;;
+  webhook)  cmd_webhook ;;
+  status)   cmd_status ;;
+  logs)     cmd_logs ;;
+  refunds)  cmd_refunds ;;
+  reset)    cmd_reset "${2:-}" ;;
+  cleanup)  cmd_cleanup ;;
+  *)        sed -n '2,22p' "$0" ;;
+esac
